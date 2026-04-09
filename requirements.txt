@@ -4,11 +4,10 @@ Werkzeug==3.0.1
 flask-cors
 gunicorn
 
-# --- AI 与视觉引擎 (最核心) ---
-# 仅安装 headless 版防止云端环境报错
+# --- AI 与视觉引擎 (轻量化) ---
+# 移除 ultralytics，改用专门的 ONNX 运行时
 opencv-python-headless
-# ultralytics 会自动安装必要的 torch(CPU版)
-ultralytics
+onnxruntime
 
 # --- 阿里云大模型 SDK ---
 dashscope>=1.14.0
@@ -16,4 +15,3 @@ dashscope>=1.14.0
 # --- 基础工具 ---
 requests>=2.31.0
 python-dotenv
-onnxruntime
