@@ -3,9 +3,10 @@ import cv2
 import base64
 import sqlite3
 import json
+import numpy as np
+import onnxruntime as ort
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from ultralytics import YOLO
 
 # 🚀 引入阿里云官方 SDK
 import dashscope 
@@ -18,8 +19,19 @@ CORS(app)
 # 设置数据库路径（适配云端环境）
 DB_PATH = os.path.join(os.getcwd(), 'cotton_platform.db')
 
-# ========== 阿里云百炼配置 ==========
-# 比赛建议：将此 Key 放在环境变量中
+# ========== 1. 硬件优化配置 (ONNX Runtime) ==========
+# 使用 onnxruntime 代替 ultralytics，内存占用可从 800MB+ 降至 200MB 以内 
+print("正在以轻量化模式加载 ONNX 模型引擎...")
+try:
+    session = ort.InferenceSession("best.onnx", providers=['CPUExecutionProvider'])
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
+    # 类别映射：请根据你训练模型时的顺序修改此处
+    CLASS_NAMES = {0: "害虫"} 
+except Exception as e:
+    print(f"❌ 模型加载失败: {e}")
+
+# ========== 2. 阿里云百炼配置 ==========
 dashscope.api_key = os.environ.get('DASHSCOPE_API_KEY', 'sk-248f40ab61e141beaa7b2948a68cb844')
 AGENT_ID = 'db0e930d13294b4f983a7506cc81e433'
 
@@ -27,11 +39,8 @@ AGENT_ID = 'db0e930d13294b4f983a7506cc81e433'
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # 用户表
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT DEFAULT 'farmer')''')
-    # 地块表
     cursor.execute('''CREATE TABLE IF NOT EXISTS fields (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, field_internal_id TEXT NOT NULL, name TEXT, risk TEXT, risk_class TEXT, latlngs TEXT, sensor_images TEXT, area REAL DEFAULT 0, crop_variety TEXT DEFAULT '', plant_date TEXT DEFAULT '')''')
-    # 记录表
     cursor.execute('''CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, time TEXT, field_name TEXT, field_internal_id TEXT, image_base64 TEXT, pest_count INTEGER, risk TEXT, advice TEXT, operation TEXT, record_type TEXT DEFAULT 'initial', parent_record_id INTEGER DEFAULT 0, scheduled_recheck_time TEXT, loop_status TEXT DEFAULT 'closed')''')
     conn.commit()
     conn.close()
@@ -94,10 +103,7 @@ def save_field():
     conn.close()
     return jsonify({"status": "success"})
 
-# --- API 路由：AI 诊断 (YOLO) ---
-print("正在加载模型...")
-model = YOLO('best.onnx', task='detect')
-
+# --- 3. API 路由：AI 诊断 (ONNX 轻量化版) ---
 @app.route('/api/detect', methods=['POST'])
 def detect_pest():
     if 'file' not in request.files: return jsonify({"status": "error", "message": "无文件"})
@@ -105,11 +111,32 @@ def detect_pest():
     temp_path = "temp_upload.jpg"
     try:
         file.save(temp_path)
-        results = model(temp_path, conf=0.25, imgsz=640) # 针对云端微调参数
-        res_img = results[0].plot()
-        _, buffer = cv2.imencode('.jpg', res_img)
+        # 读取并预处理图片 (640x640)
+        img = cv2.imread(temp_path)
+        original_img = img.copy()
+        img_resized = cv2.resize(img, (640, 640))
+        img_in = img_resized.transpose((2, 0, 1))[::-1]  # BGR to RGB
+        img_in = np.expand_dims(img_in, axis=0).astype(np.float32) / 255.0
+
+        # ONNX 推理
+        outputs = session.run([output_name], {input_name: img_in})[0]
+        
+        # 简单解析逻辑 (YOLOv8-ONNX 默认输出格式 [1, 6, 8400])
+        predictions = np.squeeze(outputs).T
+        scores = np.max(predictions[:, 4:], axis=1)
+        mask = scores > 0.3
+        valid_preds = predictions[mask]
+        
+        detected_items = []
+        for p in valid_preds:
+            cls_id = int(np.argmax(p[4:]))
+            conf = float(np.max(p[4:]))
+            detected_items.append({"name": CLASS_NAMES.get(cls_id, "未知"), "confidence": round(conf, 2)})
+
+        # 编码结果图 (为节省内存，演示中直接返回原图，画框逻辑建议放在前端或精简)
+        _, buffer = cv2.imencode('.jpg', original_img)
         img_base64 = base64.b64encode(buffer.tobytes()).decode('utf-8')
-        detected_items = [{"name": model.names[int(box.cls[0])], "confidence": round(float(box.conf[0]), 3)} for box in results[0].boxes]
+
         return jsonify({
             "status": "success",
             "data": {
@@ -119,7 +146,8 @@ def detect_pest():
                 "result_image": f"data:image/jpeg;base64,{img_base64}"
             }
         })
-    except Exception as e: return jsonify({"status": "error", "message": str(e)})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
 
@@ -137,6 +165,5 @@ def chat_with_agent():
 # --- 启动服务 ---
 if __name__ == '__main__':
     init_db()
-    # 适配 Render：读取环境变量中的端口，并监听所有 IP (0.0.0.0)
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
