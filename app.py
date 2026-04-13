@@ -6,6 +6,7 @@ import json
 import time
 import numpy as np
 import requests
+import gc  # 新增：用于强制回收内存
 import onnxruntime as ort
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -177,35 +178,34 @@ def detect_pest():
         original_img = img.copy()
         img_h, img_w = img.shape[:2]
         
-        # 缩放比例，用于稍后把框画回原图
         x_factor = img_w / 640.0
         y_factor = img_h / 640.0
         
         img_resized = cv2.resize(img, (640, 640))
-        img_in = img_resized.transpose((2, 0, 1))[::-1]  # BGR to RGB
-        img_in = np.expand_dims(img_in, axis=0).astype(np.float32) / 255.0
+        img_in = img_resized.transpose((2, 0, 1))[::-1]
+        
+        # 🚀 核心修复 1：将内存理顺 (连续化)，避免 ONNX 读出满屏雪花噪点
+        img_in = np.ascontiguousarray(img_in).astype(np.float32) / 255.0
+        img_in = np.expand_dims(img_in, axis=0)
 
         # 2. ONNX 执行推理
         outputs = session.run([output_name], {input_name: img_in})[0]
         
-        # 3. YOLO 矩阵专业解析 (添加 NMS 非极大值抑制)
-        predictions = np.squeeze(outputs).T  # 转换矩阵形状
-        
+        # 3. YOLO 矩阵解析
+        predictions = np.squeeze(outputs).T
         boxes = []
         scores = []
         class_ids = []
         
-        # 遍历所有预测结果
         for row in predictions:
             classes_scores = row[4:]
             max_score = np.max(classes_scores)
             
-            # 置信度阈值 (0.15 适合小目标害虫)
-            if max_score > 0.15: 
+            # 🚀 核心修复 2：降低阈值到 0.05，专治小虫子
+            if max_score > 0.05: 
                 class_id = np.argmax(classes_scores)
                 cx, cy, w, h = row[0], row[1], row[2], row[3]
                 
-                # 转换坐标并映射回原图尺寸
                 left = int((cx - w/2) * x_factor)
                 top = int((cy - h/2) * y_factor)
                 width = int(w * x_factor)
@@ -216,7 +216,7 @@ def detect_pest():
                 class_ids.append(class_id)
 
         # 4. 执行 NMS (过滤重叠框)
-        indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=0.15, nms_threshold=0.45)
+        indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=0.05, nms_threshold=0.45)
         
         detected_items = []
         if len(indices) > 0:
@@ -226,15 +226,14 @@ def detect_pest():
                 class_id = class_ids[i]
                 left, top, width, height = box
                 
-                # 5. 在原图上画出彩色的识别框
-                color = (0, 255, 0) # 绿色框
+                # 5. 画框
+                color = (0, 255, 0)
                 cv2.rectangle(original_img, (left, top), (left + width, top + height), color, 2)
                 label = f"{CLASS_NAMES.get(class_id, '害虫')}: {score:.2f}"
                 cv2.putText(original_img, label, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 
                 detected_items.append({"name": CLASS_NAMES.get(class_id, "害虫"), "confidence": round(score, 3)})
 
-        # 6. 将画好框的图片转回 Base64
         _, buffer = cv2.imencode('.jpg', original_img)
         img_data_url = f"data:image/jpeg;base64,{base64.b64encode(buffer.tobytes()).decode('utf-8')}"
         
@@ -251,6 +250,8 @@ def detect_pest():
         return jsonify({"status": "error", "message": str(e)})
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
+        # 🚀 核心修复 3：强行清理 OpenCV 的图片内存，防止服务器“过劳死”
+        gc.collect()
 
 @app.route('/api/chat', methods=['POST'])
 def chat_with_agent():
