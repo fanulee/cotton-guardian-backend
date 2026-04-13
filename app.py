@@ -180,10 +180,54 @@ def chat_with_agent():
 # 其它接口存根保持
 @app.route('/api/check_pending', methods=['GET'])
 def check_pending(): return jsonify({"has_pending": False})
+
 @app.route('/api/save_record', methods=['POST'])
-def save_record(): return jsonify({"status": "success"})
+def save_record():
+    try:
+        d = request.get_json()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # 🚨 这里是真正的数据库写入操作
+        cursor.execute('''INSERT INTO records (username, time, field_name, field_internal_id, image_base64, pest_count, risk, advice, operation, record_type, parent_record_id, scheduled_recheck_time, loop_status) 
+                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''', 
+                       (d.get('username'), d.get('time'), d.get('fieldName'), d.get('fieldId'), d.get('imageBase64'), d.get('pestCount'), d.get('risk'), d.get('advice'), d.get('operation'), d.get('recordType','initial'), d.get('parentRecordId',0), d.get('scheduledRecheckTime','7天后'), d.get('loopStatus','closed')))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success"})
+    except Exception as e:
+        print("归档写入失败:", e) # 在 Render 日志里打印真实错误
+        return jsonify({"status": "error", "message": str(e)})
+
 @app.route('/api/get_records', methods=['GET'])
-def get_records(): return jsonify([])
+def get_records():
+    # 1. 获取前端传来的用户名
+    username = request.args.get('username')
+    if not username:
+        return jsonify([]) # 如果没传用户名，才返回空
+
+    try:
+        # 2. 连接数据库并查询这个用户的所有记录
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row  # 这一行让返回的数据像字典一样可以通过列名访问
+        cursor = conn.cursor()
+        
+        # 按照时间倒序查询（最新的在最前面）
+        cursor.execute("SELECT * FROM records WHERE username = ? ORDER BY id DESC", (username,))
+        rows = cursor.fetchall()
+        conn.close()
+
+        # 3. 将数据库查到的数据打包成列表发回给前端
+        records_list = []
+        for row in rows:
+            records_list.append(dict(row))
+            
+        return jsonify(records_list)
+        
+    except Exception as e:
+        print("读取档案失败:", e)
+        return jsonify([]) # 如果数据库崩了，为了不让前端卡死，返回空
+
+
 @app.route('/api/delete_field', methods=['DELETE'])
 def delete_field(): return jsonify({"status": "success"})
 
