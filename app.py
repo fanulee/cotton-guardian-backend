@@ -217,68 +217,92 @@ def detect_pest():
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
 
-@app.route('/api/chat', methods=['POST'])
-def chat_with_agent():
+@app.route('/api/detect', methods=['POST'])
+def detect_pest():
+    if 'file' not in request.files: return jsonify({"status": "error", "message": "无文件"})
+    file = request.files['file']
+    temp_path = "temp_upload.jpg"
     try:
-        data = request.get_json()
-        user_message = data.get('prompt', '') or data.get('query', '')
+        file.save(temp_path)
+        # 1. 图像预处理 (640x640)
+        img = cv2.imread(temp_path)
+        original_img = img.copy()
+        img_h, img_w = img.shape[:2]
         
-        if not user_message:
-            return jsonify({"status": "error", "reply": "请输入您的问题。"})
-
-        headers = {
-            "Authorization": f"Bearer {COZE_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "bot_id": BOT_ID,
-            "user_id": "web_user_2026",
-            "stream": False,
-            "additional_messages": [
-                {"role": "user", "content": str(user_message), "content_type": "text"}
-            ]
-        }
+        # 缩放比例，用于稍后把框画回原图
+        x_factor = img_w / 640.0
+        y_factor = img_h / 640.0
         
-        print("👉 正在呼叫扣子智能体...")
-        response = requests.post(CREATE_CHAT_URL, headers=headers, json=payload, timeout=30)
-        res_json = response.json()
+        img_resized = cv2.resize(img, (640, 640))
+        img_in = img_resized.transpose((2, 0, 1))[::-1]  # BGR to RGB
+        img_in = np.expand_dims(img_in, axis=0).astype(np.float32) / 255.0
+
+        # 2. ONNX 执行推理
+        outputs = session.run([output_name], {input_name: img_in})[0]
         
-        if res_json.get('code') != 0:
-            return jsonify({"status": "error", "reply": f"接入错误: {res_json.get('msg')}"})
-
-        chat_id = res_json['data']['id']
-        conv_id = res_json['data']['conversation_id']
-
-        max_retries = 30
-        while max_retries > 0:
-            status_url = f"{RETRIEVE_URL}?chat_id={chat_id}&conversation_id={conv_id}"
-            status_resp = requests.get(status_url, headers=headers).json()
+        # 3. YOLO 矩阵专业解析 (添加 NMS 非极大值抑制)
+        predictions = np.squeeze(outputs).T  # 转换矩阵形状
+        
+        boxes = []
+        scores = []
+        class_ids = []
+        
+        # 遍历所有预测结果
+        for row in predictions:
+            classes_scores = row[4:]
+            max_score = np.max(classes_scores)
             
-            if status_resp.get('code') != 0:
-                return jsonify({"status": "error", "reply": f"状态查询失败: {status_resp.get('msg')}"})
-            
-            status = status_resp['data']['status']
-            
-            if status == 'completed':
-                msg_list_url = f"{MESSAGE_LIST_URL}?chat_id={chat_id}&conversation_id={conv_id}"
-                msg_resp = requests.get(msg_list_url, headers=headers).json()
+            # 置信度阈值 (0.15 适合小目标害虫)
+            if max_score > 0.15: 
+                class_id = np.argmax(classes_scores)
+                cx, cy, w, h = row[0], row[1], row[2], row[3]
                 
-                for msg in msg_resp.get('data', []):
-                    if msg['type'] == 'answer':
-                        return jsonify({"status": "success", "reply": msg['content']})
-                break
-            elif status == 'failed':
-                return jsonify({"status": "error", "reply": "诊断过程发生错误，请重试。"})
-            
-            time.sleep(2)
-            max_retries -= 1
+                # 转换坐标并映射回原图尺寸
+                left = int((cx - w/2) * x_factor)
+                top = int((cy - h/2) * y_factor)
+                width = int(w * x_factor)
+                height = int(h * y_factor)
+                
+                boxes.append([left, top, width, height])
+                scores.append(float(max_score))
+                class_ids.append(class_id)
 
-        return jsonify({"status": "error", "reply": "AI 诊断超时，请稍后刷新重试。"})
+        # 4. 执行 NMS (过滤重叠框)
+        indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=0.15, nms_threshold=0.45)
+        
+        detected_items = []
+        if len(indices) > 0:
+            for i in indices.flatten():
+                box = boxes[i]
+                score = scores[i]
+                class_id = class_ids[i]
+                left, top, width, height = box
+                
+                # 5. 在原图上画出彩色的识别框
+                color = (0, 255, 0) # 绿色框
+                cv2.rectangle(original_img, (left, top), (left + width, top + height), color, 2)
+                label = f"{CLASS_NAMES.get(class_id, '害虫')}: {score:.2f}"
+                cv2.putText(original_img, label, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                detected_items.append({"name": CLASS_NAMES.get(class_id, "害虫"), "confidence": round(score, 3)})
 
-    except Exception as e:
-        print(f"❌ 后端代码崩溃: {str(e)}")
-        return jsonify({"status": "error", "reply": f"系统连接故障: {str(e)}"})
+        # 6. 将画好框的图片转回 Base64
+        _, buffer = cv2.imencode('.jpg', original_img)
+        img_data_url = f"data:image/jpeg;base64,{base64.b64encode(buffer.tobytes()).decode('utf-8')}"
+        
+        return jsonify({
+            "status": "success", 
+            "data": {
+                "pest_count": len(detected_items), 
+                "details": detected_items, 
+                "risk_level": "高风险" if len(detected_items) > 5 else "安全", 
+                "result_image": img_data_url
+            }
+        })
+    except Exception as e: 
+        return jsonify({"status": "error", "message": str(e)})
+    finally:
+        if os.path.exists(temp_path): os.remove(temp_path)
 
 
 if __name__ == '__main__':
