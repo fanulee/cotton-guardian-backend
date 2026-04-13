@@ -179,7 +179,28 @@ def chat_with_agent():
 
 # 其它接口存根保持
 @app.route('/api/check_pending', methods=['GET'])
-def check_pending(): return jsonify({"has_pending": False})
+def check_pending():
+    username = request.args.get('username')
+    if not username: return jsonify({"has_pending": False, "data": []})
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # 🚨 查找这个农户名下，状态为 'pending' (待复检) 的任务
+        cursor.execute("SELECT * FROM records WHERE username = ? AND loop_status = 'pending'", (username,))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        pending_list = [dict(row) for row in rows]
+        return jsonify({
+            "has_pending": len(pending_list) > 0, 
+            "data": pending_list
+        })
+    except Exception as e:
+        print("检查复检任务失败:", e)
+        return jsonify({"has_pending": False, "data": []})
 
 @app.route('/api/save_record', methods=['POST'])
 def save_record():
