@@ -46,7 +46,6 @@ def init_db():
     conn.close()
 
 # ==================== 1. 账号与鉴权路由 ====================
-
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.get_json()
@@ -75,7 +74,6 @@ def login():
 
 
 # ==================== 2. 地块管理路由 ====================
-
 @app.route('/api/get_fields', methods=['GET'])
 def get_fields():
     username = request.args.get('username')
@@ -117,14 +115,12 @@ def delete_field():
 
 
 # ==================== 3. 档案闭环与复检路由 ====================
-
 @app.route('/api/check_pending', methods=['GET'])
 def check_pending():
     username = request.args.get('username')
     field_id = request.args.get('field_id')
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # 查找该地块最新的一条尚未闭环的任务
     cursor.execute("SELECT id, pest_count, operation FROM records WHERE username = ? AND field_internal_id = ? AND loop_status = 'pending' ORDER BY id DESC LIMIT 1", (username, field_id))
     row = cursor.fetchone()
     conn.close()
@@ -137,11 +133,8 @@ def save_record():
     data = request.get_json()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # 如果是复检记录，需要把旧任务的 loop_status 标记为 closed
     if data.get('recordType') == 'recheck':
         cursor.execute("UPDATE records SET loop_status = 'closed' WHERE id = ?", (data.get('parentRecordId'),))
-
     cursor.execute('''INSERT INTO records 
         (username, time, field_name, field_internal_id, image_base64, pest_count, risk, advice, operation, record_type, parent_record_id, scheduled_recheck_time, loop_status) 
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''', 
@@ -160,8 +153,6 @@ def get_records():
     columns = [column[0] for column in cursor.description]
     rows = cursor.fetchall()
     conn.close()
-    
-    # 将下划线命名转为驼峰命名供前端使用
     records = [dict(zip(columns, row)) for row in rows]
     formatted_records = []
     for r in records:
@@ -174,49 +165,6 @@ def get_records():
 
 
 # ==================== 4. AI 视觉与对话核心引擎 ====================
-
-@app.route('/api/detect', methods=['POST'])
-def detect_pest():
-    if 'file' not in request.files: return jsonify({"status": "error", "message": "无文件"})
-    file = request.files['file']
-    temp_path = "temp_upload.jpg"
-    try:
-        file.save(temp_path)
-        img = cv2.imread(temp_path)
-        original_img = img.copy()
-        img_resized = cv2.resize(img, (640, 640))
-        img_in = img_resized.transpose((2, 0, 1))[::-1]
-        img_in = np.expand_dims(img_in, axis=0).astype(np.float32) / 255.0
-
-        outputs = session.run([output_name], {input_name: img_in})[0]
-        
-        predictions = np.squeeze(outputs).T
-        scores = np.max(predictions[:, 4:], axis=1)
-        mask = scores > 0.25
-        valid_preds = predictions[mask]
-        
-        detected_items = []
-        for p in valid_preds:
-            cls_id = int(np.argmax(p[4:]))
-            conf = float(np.max(p[4:]))
-            detected_items.append({"name": CLASS_NAMES.get(cls_id, "害虫"), "confidence": round(conf, 3)})
-
-        _, buffer = cv2.imencode('.jpg', original_img)
-        img_data_url = f"data:image/jpeg;base64,{base64.b64encode(buffer.tobytes()).decode('utf-8')}"
-        
-        return jsonify({
-            "status": "success", 
-            "data": {
-                "pest_count": len(detected_items), 
-                "details": detected_items, 
-                "risk_level": "高风险" if len(detected_items) > 5 else "安全", 
-                "result_image": img_data_url
-            }
-        })
-    except Exception as e: return jsonify({"status": "error", "message": str(e)})
-    finally:
-        if os.path.exists(temp_path): os.remove(temp_path)
-
 @app.route('/api/detect', methods=['POST'])
 def detect_pest():
     if 'file' not in request.files: return jsonify({"status": "error", "message": "无文件"})
@@ -304,6 +252,68 @@ def detect_pest():
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
 
+@app.route('/api/chat', methods=['POST'])
+def chat_with_agent():
+    try:
+        data = request.get_json()
+        user_message = data.get('prompt', '') or data.get('query', '')
+        
+        if not user_message:
+            return jsonify({"status": "error", "reply": "请输入您的问题。"})
+
+        headers = {
+            "Authorization": f"Bearer {COZE_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "bot_id": BOT_ID,
+            "user_id": "web_user_2026",
+            "stream": False,
+            "additional_messages": [
+                {"role": "user", "content": str(user_message), "content_type": "text"}
+            ]
+        }
+        
+        print("👉 正在呼叫扣子智能体...")
+        response = requests.post(CREATE_CHAT_URL, headers=headers, json=payload, timeout=30)
+        res_json = response.json()
+        
+        if res_json.get('code') != 0:
+            return jsonify({"status": "error", "reply": f"接入错误: {res_json.get('msg')}"})
+
+        chat_id = res_json['data']['id']
+        conv_id = res_json['data']['conversation_id']
+
+        max_retries = 30
+        while max_retries > 0:
+            status_url = f"{RETRIEVE_URL}?chat_id={chat_id}&conversation_id={conv_id}"
+            status_resp = requests.get(status_url, headers=headers).json()
+            
+            if status_resp.get('code') != 0:
+                return jsonify({"status": "error", "reply": f"状态查询失败: {status_resp.get('msg')}"})
+            
+            status = status_resp['data']['status']
+            
+            if status == 'completed':
+                msg_list_url = f"{MESSAGE_LIST_URL}?chat_id={chat_id}&conversation_id={conv_id}"
+                msg_resp = requests.get(msg_list_url, headers=headers).json()
+                
+                for msg in msg_resp.get('data', []):
+                    if msg['type'] == 'answer':
+                        return jsonify({"status": "success", "reply": msg['content']})
+                break
+            elif status == 'failed':
+                return jsonify({"status": "error", "reply": "诊断过程发生错误，请重试。"})
+            
+            time.sleep(2)
+            max_retries -= 1
+
+        return jsonify({"status": "error", "reply": "AI 诊断超时，请稍后刷新重试。"})
+
+    except Exception as e:
+        print(f"❌ 后端代码崩溃: {str(e)}")
+        return jsonify({"status": "error", "reply": f"系统连接故障: {str(e)}"})
 
 if __name__ == '__main__':
     init_db()
