@@ -1,8 +1,8 @@
 Flask==2.2.5
 Werkzeug==2.2.3
-flask-cors
-gunicorn
+flask-cors==4.0.0
+gunicorn==21.2.0
 opencv-python-headless==4.7.0.72
-numpy
-requests
-python-dotenv
+numpy==1.24.3
+requests==2.31.0
+python-dotenv==1.0.0
