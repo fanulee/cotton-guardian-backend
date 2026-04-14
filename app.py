@@ -4,6 +4,15 @@ import onnxruntime as ort
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'best.onnx')
+yolo_net = None
+if os.path.exists(MODEL_PATH):
+    try:
+        yolo_net = cv2.dnn.readNetFromONNX(MODEL_PATH)
+        print("✅ 成功加载真实 YOLO 模型: best.onnx")
+    except Exception as e:
+        print(f"❌ 加载 YOLO 模型失败: {e}")
+
 # 1. 初始化 Flask 服务
 app = Flask(__name__)
 CORS(app)
@@ -72,86 +81,89 @@ def save_field():
     conn.commit(); conn.close(); return jsonify({"status": "success"})
 
 # ==================== 视觉核心 (全自适应解析版) ====================
+# ================= 替换您的 detect 接口 =================
 @app.route('/api/detect', methods=['POST'])
-def detect_pest():
-    if 'file' not in request.files: return jsonify({"status": "error", "message": "无文件"})
-    file = request.files['file']; temp_path = "temp_u.jpg"
+def detect():
+    if 'file' not in request.files:
+        return jsonify({"status": "error", "message": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"status": "error", "message": "No selected file"}), 400
+
     try:
-        file.save(temp_path); img = cv2.imread(temp_path); orig = img.copy()
-        h, w = img.shape[:2]
-        
-        # 1. 预处理
-        blob = cv2.resize(img, (640, 640))
-        blob = cv2.cvtColor(blob, cv2.COLOR_BGR2RGB).transpose((2, 0, 1))
-        blob = np.ascontiguousarray(blob).astype(np.float32) / 255.0
-        blob = np.expand_dims(blob, axis=0)
+        # 1. 读取图片
+        file_bytes = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-        # 2. 推理
-        outs = session.run([output_name], {input_name: blob})[0]
-        
-        # 3. 动态矩阵解析 (核心改进)
-        # 如果是 (1, 7, 8400) 格式，需要转置
-        if outs.shape[1] < outs.shape[2]: 
-            preds = np.squeeze(outs).T
-        else: 
-            preds = np.squeeze(outs)
+        pest_count = 0
 
-        boxes, scores, cids = [], [], []
-        # 计算缩放因子
-        xf, yf = w / 640.0, h / 640.0
-
-        for row in preds:
-            # 前4位是坐标，后面是所有类别的得分
-            # 有些模型输出包含 objectness，所以我们要动态取类别得分
-            prob_scores = row[4:] 
-            max_s = np.max(prob_scores)
+        # 2. 真实 YOLO ONNX 模型推理
+        if yolo_net is not None:
+            # YOLOv8 预处理 (按 640x640)
+            blob = cv2.dnn.blobFromImage(img, 1/255.0, (640, 640), swapRB=True, crop=False)
+            yolo_net.setInput(blob)
+            outputs = yolo_net.forward()
             
-            # 🚀 极致灵敏：即使是很小的虫子也能被捕捉
-            if max_s > 0.02: 
-                cid = np.argmax(prob_scores)
-                cx, cy, bw, bh = row[0], row[1], row[2], row[3]
-                
-                # 转换到原图坐标
-                l = int((cx - bw/2) * xf)
-                t = int((cy - bh/2) * yf)
-                rw = int(bw * xf)
-                rh = int(bh * yf)
-                
-                boxes.append([l, t, rw, rh])
-                scores.append(float(max_s))
-                cids.append(cid)
+            # 提取预测结果
+            outputs = np.transpose(np.squeeze(outputs))
+            rows = outputs.shape[0]
 
-        # 4. 非极大值抑制 (NMS)
-        indices = cv2.dnn.NMSBoxes(boxes, scores, 0.02, 0.45)
-        
-        results = []
-        if len(indices) > 0:
-            # 兼容不同版本的 NMS 返回值
-            idx_list = indices.flatten() if hasattr(indices, 'flatten') else indices
-            for i in idx_list:
-                b = boxes[i]
-                # 5. 在大图上画框
-                cv2.rectangle(orig, (b[0], b[1]), (b[0]+b[2], b[1]+b[3]), (0, 255, 0), 3)
-                # 写上文字
-                label = f"{CLASS_NAMES.get(cids[i], 'Bug')}:{scores[i]:.2f}"
-                cv2.putText(orig, label, (b[0], b[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                results.append({"name": CLASS_NAMES.get(cids[i], "害虫"), "conf": round(scores[i], 2)})
+            boxes = []
+            scores = []
+            
+            h, w = img.shape[:2]
+            x_factor = w / 640.0
+            y_factor = h / 640.0
 
-        _, buf = cv2.imencode('.jpg', orig)
-        img_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf).decode()}"
+            for i in range(rows):
+                classes_scores = outputs[i][4:]
+                max_score = np.amax(classes_scores)
+                if max_score >= 0.25: # 置信度阈值
+                    x, y, bw, bh = outputs[i][0], outputs[i][1], outputs[i][2], outputs[i][3]
+                    left = int((x - bw / 2) * x_factor)
+                    top = int((y - bh / 2) * y_factor)
+                    width = int(bw * x_factor)
+                    height = int(bh * y_factor)
+                    
+                    boxes.append([left, top, width, height])
+                    scores.append(float(max_score))
+
+            # 非极大值抑制，去除重叠框
+            indices = cv2.dnn.NMSBoxes(boxes, scores, 0.25, 0.45)
+            
+            if len(indices) > 0:
+                pest_count = len(indices)
+                for i in indices.flatten():
+                    box = boxes[i]
+                    left, top, width, height = box[0], box[1], box[2], box[3]
+                    # 绘制真实模型给出的红色边界框
+                    cv2.rectangle(img, (left, top), (left + width, top + height), (0, 0, 255), 2)
+                    cv2.putText(img, "Pest", (left, top - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        else:
+            # 防御机制：如果模型没加载成功，为了不让前端死机，给一个错误提示
+            return jsonify({"status": "error", "message": "YOLO 引擎未挂载！"}), 500
+
+        # 3. 图片转回 Base64 发给前端
+        import base64
+        _, buffer = cv2.imencode('.jpg', img)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
         
-        del img, orig, blob; gc.collect()
+        risk_level = "高风险" if pest_count > 5 else "安全"
+        
         return jsonify({
-            "status": "success", 
+            "status": "success",
             "data": {
-                "pest_count": len(results), 
-                "risk_level": "高风险" if len(results) > 3 else "安全", 
-                "result_image": img_b64
+                "pest_count": pest_count,
+                "risk_level": risk_level,
+                "result_image": f"data:image/jpeg;base64,{img_base64}"
             }
         })
-    except Exception as e: return jsonify({"status": "error", "message": str(e)})
-    finally:
-        if os.path.exists(temp_path): os.remove(temp_path)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 
 @app.route('/api/chat', methods=['POST'])
 def chat_with_agent():
