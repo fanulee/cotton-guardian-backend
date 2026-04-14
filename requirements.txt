@@ -1,13 +1,8 @@
-# --- 核心 Web 框架 ---
-Flask==3.0.2
-Werkzeug==3.0.1
+Flask==2.2.5
+Werkzeug==2.2.3
 flask-cors
 gunicorn
-
-# --- 视觉引擎 (极度轻量化) ---
-opencv-python-headless
+opencv-python-headless==4.7.0.72
 numpy
-
-# --- 网络与基础工具 ---
-requests>=2.31.0
+requests
 python-dotenv
