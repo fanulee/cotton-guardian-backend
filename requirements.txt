@@ -4,14 +4,10 @@ Werkzeug==3.0.1
 flask-cors
 gunicorn
 
-# --- AI 与视觉引擎 (轻量化) ---
-# 移除 ultralytics，改用专门的 ONNX 运行时
+# --- 视觉引擎 (极度轻量化) ---
 opencv-python-headless
-onnxruntime
+numpy
 
-# --- 阿里云大模型 SDK ---
-dashscope>=1.14.0
-
-# --- 基础工具 ---
+# --- 网络与基础工具 ---
 requests>=2.31.0
 python-dotenv
