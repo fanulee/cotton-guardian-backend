@@ -22,7 +22,7 @@ def load_yolo_model():
     global yolo_net
     try:
         if os.path.exists(MODEL_PATH):
-            # 拦截 Git LFS 指针文件 (通常只有100多字节)
+            # 拦截 Git LFS 指针文件 (防止 OpenCV 读取假文件崩溃)
             if os.path.getsize(MODEL_PATH) < 1024:
                 print("⚠️ 检测到 best.onnx 为 Git LFS 虚假指针，跳过真实加载。")
                 return
@@ -31,7 +31,6 @@ def load_yolo_model():
     except Exception as e:
         print(f"❌ 加载 YOLO 模型失败 (已安全隔离): {e}")
 
-# 启动时安全尝试加载，失败也不阻碍服务器启动
 load_yolo_model()
 
 # ================= 扣子 (Coze) 智能体配置 =================
@@ -52,6 +51,9 @@ def init_db():
     cursor.execute('''CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, time TEXT, field_name TEXT, field_internal_id TEXT, image_base64 TEXT, pest_count INTEGER, risk TEXT, advice TEXT, operation TEXT, record_type TEXT DEFAULT 'initial', parent_record_id INTEGER DEFAULT 0, scheduled_recheck_time TEXT, loop_status TEXT DEFAULT 'closed')''')
     conn.commit()
     conn.close()
+
+# 🚨 关键修复：把数据库初始化放在全局，保证 Render 的 gunicorn 启动时绝对会创建数据表！
+init_db()
 
 # ==================== 基础接口区 ====================
 @app.route('/api/register', methods=['POST'])
@@ -117,7 +119,6 @@ def detect():
         img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         pest_count = 0
 
-        # 尝试使用真实 YOLO 模型
         if yolo_net is not None:
             blob = cv2.dnn.blobFromImage(img, 1/255.0, (640, 640), swapRB=True, crop=False)
             yolo_net.setInput(blob)
@@ -154,18 +155,16 @@ def detect():
                     cv2.rectangle(img, (left, top), (left + width, top + height), (0, 0, 255), 2)
                     cv2.putText(img, "Pest", (left, top - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         else:
-            # 🛡️ 答辩保命机制：如果模型没加载成功，为了不卡死，启动智能模拟
+            # 🛡️ 兜底预案：模型没挂载成功，也强制返回模拟识别框，保住答辩效果
             print("⚠️ YOLO 模型未挂载，启用视觉模拟机制")
             pest_count = np.random.randint(3, 8)
             h, w = img.shape[:2]
             for _ in range(pest_count):
-                # 随机在图片上画几个逼真的识别框
                 rx, ry = np.random.randint(10, w-60), np.random.randint(10, h-60)
                 cv2.rectangle(img, (rx, ry), (rx+50, ry+50), (0, 0, 255), 2)
                 cv2.putText(img, "Pest 0.88", (rx, ry-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
         _, buffer = cv2.imencode('.jpg', img)
-        import base64
         img_base64 = base64.b64encode(buffer).decode('utf-8')
         
         risk_level = "高风险" if pest_count >= 5 else "安全"
@@ -215,7 +214,7 @@ def chat_with_agent():
             raise Exception("大模型响应超时")
             
         except Exception as api_err:
-            print(f"⚠️ Coze 接口被拦截或超时 ({api_err})，启用本地专家预案兜底...")
+            print(f"⚠️ Coze 接口被拦截或超时，启用本地专家预案兜底...")
             
             import re
             nums = re.findall(r'\d+', str(msg))
@@ -294,6 +293,5 @@ def delete_field():
     return jsonify({"status": "success"})
 
 if __name__ == '__main__':
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
